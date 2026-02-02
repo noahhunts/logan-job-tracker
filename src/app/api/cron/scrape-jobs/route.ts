@@ -88,7 +88,19 @@ async function searchForNewJobs() {
   // using libraries like puppeteer, cheerio, or APIs
 
   // Example structure for scraped jobs:
-  const sampleJobs = [
+  const sampleJobs: Array<{
+    title: string
+    company: string
+    url: string
+    location: string
+    salary: string
+    remote: string
+    priority: string
+    notes: string
+    source: string
+    date_found: string
+    status: string
+  }> = [
     // Jobs would be populated from actual scraping
   ]
 
