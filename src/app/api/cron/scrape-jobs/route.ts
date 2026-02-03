@@ -63,9 +63,8 @@ export async function GET(request: NextRequest) {
     let jobsAdded = 0
 
     for (const job of allJobs) {
-      // Verify URL exists and is a real job link (not a search page)
-      if (!job.url || job.url.includes('?q=') || job.url.includes('/search') ||
-          job.url.endsWith('/jobs') || job.url.endsWith('/careers') || job.url.endsWith('/careers/')) {
+      // Strict URL validation - must be a direct job link
+      if (!isValidJobUrl(job.url)) {
         continue
       }
 
@@ -99,6 +98,42 @@ export async function GET(request: NextRequest) {
     console.error('Scrape error:', error)
     return NextResponse.json({ success: false, error: String(error) }, { status: 500 })
   }
+}
+
+// Validate URL is a direct job link, not a search page or generic careers page
+function isValidJobUrl(url: string | undefined): boolean {
+  if (!url || url.length < 30) return false
+
+  const lowerUrl = url.toLowerCase()
+
+  // Reject search/query pages
+  if (lowerUrl.includes('?q=') || lowerUrl.includes('?search=') ||
+      lowerUrl.includes('/search') || lowerUrl.includes('/q-')) {
+    return false
+  }
+
+  // Reject generic career pages (must have specific job ID/slug after)
+  const genericEndings = [
+    '/jobs', '/careers', '/careers/', '/jobs/', '/openings', '/positions',
+    '.com', '.org', '.net', '.io', '.ai', '.co'
+  ]
+  if (genericEndings.some(ending => lowerUrl.endsWith(ending))) {
+    return false
+  }
+
+  // Must have a job-specific path segment (ID, slug, etc.)
+  const jobPatterns = [
+    /\/job\/[a-z0-9-]+/i,           // /job/some-job-id
+    /\/jobs\/[a-z0-9-]+/i,          // /jobs/some-job-slug
+    /\/view\/[a-z0-9-]+/i,          // LinkedIn /view/job-id
+    /\/viewjob\?/i,                  // Indeed viewjob?jk=
+    /\/position\/[a-z0-9-]+/i,       // /position/id
+    /\/opening\/[a-z0-9-]+/i,        // /opening/id
+    /\/[a-z]+-[a-z]+-\d+/i,          // slug-with-numbers-123
+    /\/\d{5,}/                        // Numeric job ID 5+ digits
+  ]
+
+  return jobPatterns.some(pattern => pattern.test(url))
 }
 
 // STRICT check - keyword must be in title OR company name
