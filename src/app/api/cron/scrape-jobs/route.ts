@@ -6,16 +6,18 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 )
 
-// Keywords to search for dental/3D printing jobs
-const DENTAL_KEYWORDS = [
-  'dental', '3d printing', 'cad', 'cam', '3shape', 'intraoral', 'scanner',
-  'digital workflow', 'dental lab', 'prosthodontic', 'orthodontic'
+// STRICT dental/3D printing keywords - must be in title or company
+const REQUIRED_KEYWORDS = [
+  'dental', 'dentist', 'dentistry', 'orthodont', 'prosthodont',
+  '3shape', 'sprintray', 'medit', 'trios', 'itero', 'cerec',
+  'intraoral', 'dental lab', 'dental tech', 'dental cad', 'dental cam',
+  'crown and bridge', 'denture', 'implant planning'
 ]
 
-// Keywords that indicate high priority for Logan's skillset
+// High priority keywords for Logan's specific skills
 const HIGH_PRIORITY_KEYWORDS = [
-  '3shape', 'sprintray', 'trios', 'medit', 'intraoral scanner', 'dental 3d',
-  'digital workflow', 'dental trainer', 'clinical trainer'
+  '3shape', 'sprintray', 'trios', 'medit', 'intraoral scanner',
+  'digital workflow', 'dental trainer', 'clinical trainer', 'dental 3d'
 ]
 
 type JobResult = {
@@ -45,49 +47,45 @@ export async function GET(request: NextRequest) {
       .select()
       .single()
 
-    // Fetch jobs from multiple free sources
     const allJobs: JobResult[] = []
 
-    // 1. RemoteOK API (free, no auth required)
-    const remoteOkJobs = await fetchRemoteOK()
-    allJobs.push(...remoteOkJobs)
+    // Fetch from multiple sources with STRICT dental filtering
+    const sources = await Promise.all([
+      fetchRemoteOK(),
+      fetchArbeitnow(),
+      fetchHimalayas(),
+      fetchJobicy(),
+      fetchDentalPost(), // Dental-specific job board
+    ])
 
-    // 2. Arbeitnow API (free remote jobs)
-    const arbeitnowJobs = await fetchArbeitnow()
-    allJobs.push(...arbeitnowJobs)
-
-    // 3. Himalayas API (remote jobs)
-    const himalayasJobs = await fetchHimalayas()
-    allJobs.push(...himalayasJobs)
-
-    // 4. Jobicy RSS/API (remote jobs)
-    const jobicyJobs = await fetchJobicy()
-    allJobs.push(...jobicyJobs)
+    sources.forEach(jobs => allJobs.push(...jobs))
 
     let jobsAdded = 0
 
     for (const job of allJobs) {
+      // Verify URL exists and is a real job link (not a search page)
+      if (!job.url || job.url.includes('?q=') || job.url.includes('/search') ||
+          job.url.endsWith('/jobs') || job.url.endsWith('/careers') || job.url.endsWith('/careers/')) {
+        continue
+      }
+
       // Check for duplicates
       const { data: existing } = await supabase
         .from('jobs')
         .select('id')
-        .or(`url.eq.${job.url},and(title.ilike.%${job.title.substring(0, 30)}%,company.ilike.%${job.company}%)`)
+        .eq('url', job.url)
         .limit(1)
 
       if (!existing || existing.length === 0) {
-        await supabase.from('jobs').insert([job])
-        jobsAdded++
+        const { error } = await supabase.from('jobs').insert([job])
+        if (!error) jobsAdded++
       }
     }
 
     if (logEntry) {
       await supabase
         .from('scrape_logs')
-        .update({
-          jobs_found: allJobs.length,
-          jobs_added: jobsAdded,
-          status: 'completed'
-        })
+        .update({ jobs_found: allJobs.length, jobs_added: jobsAdded, status: 'completed' })
         .eq('id', logEntry.id)
     }
 
@@ -95,43 +93,53 @@ export async function GET(request: NextRequest) {
       success: true,
       jobsFound: allJobs.length,
       jobsAdded,
-      sources: {
-        remoteOk: remoteOkJobs.length,
-        arbeitnow: arbeitnowJobs.length,
-        himalayas: himalayasJobs.length,
-        jobicy: jobicyJobs.length
-      },
-      message: `Scrape completed. Found ${allJobs.length} dental/3D printing jobs, added ${jobsAdded} new jobs.`
+      message: `Found ${allJobs.length} dental jobs, added ${jobsAdded} new jobs.`
     })
   } catch (error) {
     console.error('Scrape error:', error)
-    return NextResponse.json({ success: false, error: 'Scrape failed', details: String(error) }, { status: 500 })
+    return NextResponse.json({ success: false, error: String(error) }, { status: 500 })
   }
 }
 
-function isDentalOrRelevant(title: string, description: string = '', tags: string[] = []): boolean {
-  const searchText = `${title} ${description} ${tags.join(' ')}`.toLowerCase()
-  return DENTAL_KEYWORDS.some(keyword => searchText.includes(keyword.toLowerCase()))
+// STRICT check - keyword must be in title OR company name
+function isDentalJob(title: string, company: string, description: string = ''): boolean {
+  const titleLower = title.toLowerCase()
+  const companyLower = company.toLowerCase()
+  const descLower = description.toLowerCase()
+
+  // Must have dental keyword in TITLE or COMPANY (not just description)
+  const inTitleOrCompany = REQUIRED_KEYWORDS.some(kw =>
+    titleLower.includes(kw.toLowerCase()) || companyLower.includes(kw.toLowerCase())
+  )
+
+  // Or have multiple keywords in description (more lenient for description)
+  const keywordsInDesc = REQUIRED_KEYWORDS.filter(kw => descLower.includes(kw.toLowerCase()))
+  const strongDescMatch = keywordsInDesc.length >= 2
+
+  return inTitleOrCompany || strongDescMatch
 }
 
-function calculatePriority(title: string, description: string = '', tags: string[] = []): 'HIGH' | 'MEDIUM' | 'LOW' {
-  const searchText = `${title} ${description} ${tags.join(' ')}`.toLowerCase()
-  const matchCount = HIGH_PRIORITY_KEYWORDS.filter(kw => searchText.includes(kw.toLowerCase())).length
-  if (matchCount >= 2) return 'HIGH'
-  if (matchCount === 1) return 'MEDIUM'
+function calculatePriority(title: string, company: string, description: string = ''): 'HIGH' | 'MEDIUM' | 'LOW' {
+  const text = `${title} ${company} ${description}`.toLowerCase()
+  const matches = HIGH_PRIORITY_KEYWORDS.filter(kw => text.includes(kw.toLowerCase()))
+  if (matches.length >= 2) return 'HIGH'
+  if (matches.length === 1) return 'MEDIUM'
+
+  // Dental CAD/CAM or training roles are at least medium
+  if (text.includes('cad') || text.includes('trainer') || text.includes('workflow')) return 'MEDIUM'
   return 'LOW'
 }
 
-function generateNotes(title: string, description: string = '', tags: string[] = []): string {
-  const searchText = `${title} ${description} ${tags.join(' ')}`.toLowerCase()
-  const matches = HIGH_PRIORITY_KEYWORDS.filter(kw => searchText.includes(kw.toLowerCase()))
+function generateNotes(title: string, company: string, description: string = ''): string {
+  const text = `${title} ${company} ${description}`.toLowerCase()
+  const matches = HIGH_PRIORITY_KEYWORDS.filter(kw => text.includes(kw.toLowerCase()))
   if (matches.length > 0) {
-    return `Matches Logan's skills: ${matches.join(', ')}. Auto-discovered.`
+    return `Skills match: ${matches.join(', ')}. Auto-discovered.`
   }
-  return 'Auto-discovered from job search. Review for fit.'
+  return 'Auto-discovered dental job. Review for fit.'
 }
 
-// RemoteOK API - Free, no auth
+// RemoteOK - search specifically for dental
 async function fetchRemoteOK(): Promise<JobResult[]> {
   try {
     const response = await fetch('https://remoteok.com/api', {
@@ -142,41 +150,37 @@ async function fetchRemoteOK(): Promise<JobResult[]> {
     const data = await response.json()
     const jobs: JobResult[] = []
 
-    for (const job of data.slice(1, 100)) { // First item is metadata
-      if (!job.position || !job.company) continue
+    for (const job of data.slice(1)) {
+      if (!job.position || !job.company || !job.url) continue
 
-      const tags = job.tags || []
-      const description = job.description || ''
+      const desc = job.description || ''
+      if (!isDentalJob(job.position, job.company, desc)) continue
 
-      // Filter for dental/medical/3D printing related jobs
-      if (isDentalOrRelevant(job.position, description, tags) ||
-          tags.some((t: string) => ['3d', 'cad', 'medical', 'healthcare', 'design'].includes(t.toLowerCase()))) {
-        jobs.push({
-          title: job.position,
-          company: job.company,
-          url: job.url || `https://remoteok.com/remote-jobs/${job.id}`,
-          location: job.location || 'Remote',
-          salary: job.salary_min && job.salary_max ? `$${job.salary_min}-$${job.salary_max}` : 'Not disclosed',
-          remote: 'Yes',
-          priority: calculatePriority(job.position, description, tags),
-          notes: generateNotes(job.position, description, tags),
-          source: 'remoteok.com',
-          date_found: new Date().toISOString().split('T')[0],
-          status: 'New'
-        })
-      }
+      jobs.push({
+        title: job.position,
+        company: job.company,
+        url: job.url,
+        location: job.location || 'Remote',
+        salary: job.salary_min && job.salary_max ? `$${job.salary_min}-$${job.salary_max}` : 'Not disclosed',
+        remote: 'Yes',
+        priority: calculatePriority(job.position, job.company, desc),
+        notes: generateNotes(job.position, job.company, desc),
+        source: 'remoteok.com',
+        date_found: new Date().toISOString().split('T')[0],
+        status: 'New'
+      })
     }
     return jobs
   } catch (e) {
-    console.error('RemoteOK fetch error:', e)
+    console.error('RemoteOK error:', e)
     return []
   }
 }
 
-// Arbeitnow API - Free remote jobs
+// Arbeitnow - search with dental keywords
 async function fetchArbeitnow(): Promise<JobResult[]> {
   try {
-    const searches = ['dental', '3d+printing', 'cad+designer', 'medical+device']
+    const searches = ['dental', 'dentist', '3d+printing+medical', 'orthodont']
     const jobs: JobResult[] = []
 
     for (const search of searches) {
@@ -184,60 +188,56 @@ async function fetchArbeitnow(): Promise<JobResult[]> {
       if (!response.ok) continue
 
       const data = await response.json()
+      for (const job of (data.data || [])) {
+        if (!job.title || !job.company_name || !job.url) continue
+        if (!isDentalJob(job.title, job.company_name, job.description || '')) continue
 
-      for (const job of (data.data || []).slice(0, 20)) {
-        if (!job.title || !job.company_name) continue
-
-        if (isDentalOrRelevant(job.title, job.description || '', job.tags || [])) {
-          jobs.push({
-            title: job.title,
-            company: job.company_name,
-            url: job.url || '',
-            location: job.location || 'Remote',
-            salary: 'Not disclosed',
-            remote: job.remote ? 'Yes' : 'Check listing',
-            priority: calculatePriority(job.title, job.description || '', job.tags || []),
-            notes: generateNotes(job.title, job.description || '', job.tags || []),
-            source: 'arbeitnow.com',
-            date_found: new Date().toISOString().split('T')[0],
-            status: 'New'
-          })
-        }
+        jobs.push({
+          title: job.title,
+          company: job.company_name,
+          url: job.url,
+          location: job.location || 'Remote',
+          salary: 'Not disclosed',
+          remote: job.remote ? 'Yes' : 'Check listing',
+          priority: calculatePriority(job.title, job.company_name, job.description || ''),
+          notes: generateNotes(job.title, job.company_name, job.description || ''),
+          source: 'arbeitnow.com',
+          date_found: new Date().toISOString().split('T')[0],
+          status: 'New'
+        })
       }
     }
     return jobs
   } catch (e) {
-    console.error('Arbeitnow fetch error:', e)
+    console.error('Arbeitnow error:', e)
     return []
   }
 }
 
-// Himalayas API - Remote jobs
+// Himalayas - filter for dental
 async function fetchHimalayas(): Promise<JobResult[]> {
   try {
-    const response = await fetch('https://himalayas.app/jobs/api?limit=100')
-    if (!response.ok) return []
-
-    const data = await response.json()
+    // Search multiple pages with dental-related queries
     const jobs: JobResult[] = []
 
-    for (const job of (data.jobs || [])) {
-      if (!job.title || !job.companyName) continue
+    for (const query of ['dental', 'dentist', 'orthodontist']) {
+      const response = await fetch(`https://himalayas.app/jobs/api?limit=50&q=${query}`)
+      if (!response.ok) continue
 
-      const categories = job.categories || []
-      const description = job.description || ''
+      const data = await response.json()
+      for (const job of (data.jobs || [])) {
+        if (!job.title || !job.companyName || !job.applicationLink) continue
+        if (!isDentalJob(job.title, job.companyName, job.description || '')) continue
 
-      if (isDentalOrRelevant(job.title, description, categories) ||
-          categories.some((c: string) => ['Healthcare', 'Medical', 'Design', 'Engineering'].includes(c))) {
         jobs.push({
           title: job.title,
           company: job.companyName,
-          url: job.applicationLink || `https://himalayas.app/jobs/${job.slug}`,
-          location: job.locationRestrictions?.join(', ') || 'Remote Worldwide',
+          url: job.applicationLink,
+          location: job.locationRestrictions?.join(', ') || 'Remote',
           salary: job.minSalary && job.maxSalary ? `$${job.minSalary}-$${job.maxSalary}` : 'Not disclosed',
           remote: 'Yes',
-          priority: calculatePriority(job.title, description, categories),
-          notes: generateNotes(job.title, description, categories),
+          priority: calculatePriority(job.title, job.companyName, job.description || ''),
+          notes: generateNotes(job.title, job.companyName, job.description || ''),
           source: 'himalayas.app',
           date_found: new Date().toISOString().split('T')[0],
           status: 'New'
@@ -246,49 +246,61 @@ async function fetchHimalayas(): Promise<JobResult[]> {
     }
     return jobs
   } catch (e) {
-    console.error('Himalayas fetch error:', e)
+    console.error('Himalayas error:', e)
     return []
   }
 }
 
-// Jobicy API - Remote jobs focused
+// Jobicy - medical/health category
 async function fetchJobicy(): Promise<JobResult[]> {
   try {
-    const response = await fetch('https://jobicy.com/api/v2/remote-jobs?count=50&industry=medical-health')
+    const response = await fetch('https://jobicy.com/api/v2/remote-jobs?count=100&industry=medical-health')
     if (!response.ok) return []
 
     const data = await response.json()
     const jobs: JobResult[] = []
 
     for (const job of (data.jobs || [])) {
-      if (!job.jobTitle || !job.companyName) continue
+      if (!job.jobTitle || !job.companyName || !job.url) continue
+      if (!isDentalJob(job.jobTitle, job.companyName, job.jobDescription || '')) continue
 
-      if (isDentalOrRelevant(job.jobTitle, job.jobDescription || '', [])) {
-        jobs.push({
-          title: job.jobTitle,
-          company: job.companyName,
-          url: job.url || '',
-          location: job.jobGeo || 'Remote',
-          salary: job.annualSalaryMin && job.annualSalaryMax
-            ? `$${job.annualSalaryMin}-$${job.annualSalaryMax}`
-            : 'Not disclosed',
-          remote: 'Yes',
-          priority: calculatePriority(job.jobTitle, job.jobDescription || '', []),
-          notes: generateNotes(job.jobTitle, job.jobDescription || '', []),
-          source: 'jobicy.com',
-          date_found: new Date().toISOString().split('T')[0],
-          status: 'New'
-        })
-      }
+      jobs.push({
+        title: job.jobTitle,
+        company: job.companyName,
+        url: job.url,
+        location: job.jobGeo || 'Remote',
+        salary: job.annualSalaryMin && job.annualSalaryMax
+          ? `$${job.annualSalaryMin}-$${job.annualSalaryMax}` : 'Not disclosed',
+        remote: 'Yes',
+        priority: calculatePriority(job.jobTitle, job.companyName, job.jobDescription || ''),
+        notes: generateNotes(job.jobTitle, job.companyName, job.jobDescription || ''),
+        source: 'jobicy.com',
+        date_found: new Date().toISOString().split('T')[0],
+        status: 'New'
+      })
     }
     return jobs
   } catch (e) {
-    console.error('Jobicy fetch error:', e)
+    console.error('Jobicy error:', e)
     return []
   }
 }
 
-// Manual trigger endpoint
+// DentalPost RSS feed - dental-specific job board
+async function fetchDentalPost(): Promise<JobResult[]> {
+  try {
+    // DentalPost doesn't have a public API, but we can try their job listings page
+    // This is a placeholder - in production, you'd need to set up proper scraping
+    // or use a service like ScrapingBee/Browserless
+
+    // For now, we'll rely on the other sources with strict filtering
+    return []
+  } catch (e) {
+    console.error('DentalPost error:', e)
+    return []
+  }
+}
+
 export async function POST(request: NextRequest) {
   return GET(request)
 }
